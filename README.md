@@ -1,54 +1,53 @@
 # cpp-zmq-bookstore-demo
-C++ + ZeroMQ 书店销售统计演示项目
-采用 PUSH-PULL 消息模型，实现多线程并发统计销售数据；集成Lua动态配置、Msgpack二进制序列化、定时HTTP指标上报。
 
-## 依赖环境（Ubuntu系统）
-```bash
-sudo apt install libzmq3-dev luajit libcurl-dev
-```
-组件说明：
-ZeroMQ：消息队列，客户端与服务端通信
-LuaJIT + LuaBridge：加载外部配置 conf.lua
-cpr/curl：HTTP 接口上报统计数据
-msgpack-cxx：业务数据序列化
+ZeroMQ PUSH/PULL 单向订单消息管道：客户端推送订单，服务端线程池并发解码、按商品 ID 聚合，定时把统计结果 POST 到业务接口。
 
-编译流程
-克隆代码
-```bash
-git clone https://github.com/WenjunXueCPP/cpp-zmq-bookstore-demo.git
-cd cpp-zmq-bookstore-demo
-```
+基于 C++ 课程示例改造：修复崩溃、引入线程池、补充压测。
 
-创建编译目录构建项目
-```bash
-mkdir build
-cd build
-cmake ..
-make -j4
-```
+## 改造点
 
-启动运行
-建议项目根目录运行程序，配置文件conf.lua可直接加载，无需复制文件。
-终端 1（启动服务端）
-```bash
-./build/srv
-```
-终端 2（启动客户端，模拟门店推送销售订单）
-```bash
-./build/client
-```
+1. **修复 msgpack 悬空引用**：原版 `msgpack::unpack(...).get()` 返回的 object 指向临时 `object_handle` 的 zone，语句结束 zone 即释放，`convert` 读的是已释放内存。改为 `msgpack::object_handle oh = msgpack::unpack(...)`，再 `oh.get().convert(book)`。
+2. **线程池替代 detach**：原版每条消息 `std::thread(...).detach()`，无上限。改为固定大小线程池（mutex + condvar + 任务队列），worker 数由 `conf.lua` 的 `thread_num` 决定。
+3. **去掉逐条打印**：原版每条消息 `cout << count << endl`。改为独立 monitor 线程每秒输出 `[qps] done recv`。
+4. **聚合结构**：`std::map` + 全局自旋锁改为 `unordered_map` + 增量维护 min/max。
 
-目录代码说明
-srv.cpp：服务端，接收消息、多线程聚合统计销售信息
-client.cpp：生产者客户端，模拟发送销售数据
-SalesData.hpp：销售数据结构体，提供序列化 / 反序列化
-Summary.hpp：线程安全的数据汇总模块
-SpinLock.hpp：自研自旋锁实现
-Zmq.hpp：ZeroMQ 简易封装
-Config.hpp：Lua 配置文件读取封装
-conf.lua：项目外部配置
+## 改造前崩溃
 
-额外备注
-build 为本地编译生成文件夹，通过.gitignore 忽略，不上传仓库；
-运行出现http post failed属于正常现象：本地没有部署对应的 http 接收服务，不影响 ZMQ 消息收发核心功能；
-使用 Ctrl + C 终止程序。
+~~~text
+order server start
+http post failed
+terminate called after throwing an instance of 'msgpack::v1::type_error'
+  what():  std::bad_cast
+~~~
+
+服务端收到第 4 条消息即 abort（use-after-free）。
+
+## 压测结果
+
+环境：VMware Ubuntu 64 位，4 核 / 3 GB，srv 与 bench_client 同机。
+
+| worker | 消息量 | 稳定吞吐 | 处理完毕 |
+|---|---|---|---|
+| 1 | 160,000 | 9.5 万 msg/s | 约 1.7 s |
+| 8 | 800,000 | 25 万 msg/s | 约 3.2 s |
+
+4 核机器上 8 worker 超订 2 倍，加速比 2.6×（65% 扩展效率）。剩余瓶颈：`Summary::add_sales` 的全局自旋锁、`ZmqContext<1>` 单 IO 线程。
+
+口径说明：25 万 msg/s 是消息解码 + 内存聚合吞吐，无 DB、无磁盘、无下游调用。客户端侧 `send` 返回的 msg/s 只反映写入 ZeroMQ 发送缓冲区的速度，不代表服务端处理完成。
+
+## 构建与压测
+
+~~~bash
+mkdir -p build && cd build
+cmake .. && make -j4
+./srv                    # 终端 1
+./bench_client 8 100000  # 终端 2，8 线程各 10 万条
+~~~
+
+服务端每秒输出：
+
+~~~text
+[qps] 253521  done 549387  recv 800000
+~~~
+
+`recv - done` 为队列积压量。
