@@ -1,4 +1,4 @@
-# cpp-zmq-bookstore-demo
+# cpp-zmq-bookstore
 
 ZeroMQ PUSH/PULL 单向订单消息管道：客户端推送订单，服务端线程池并发解码、按商品 ID 聚合，定时把统计结果 POST 到业务接口。
 
